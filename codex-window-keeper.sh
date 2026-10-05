@@ -5,26 +5,29 @@
 # A Codex five-hour window only starts counting when a request is made.  This
 # script sends one very cheap ephemeral request at the reset boundary so the
 # window does not sit idle, then exits.  It sends at most one request per
-# five-hour window.
+# five-hour window.  It talks to OpenAI directly.
 #
 # Timing sources, in order of preference:
-#   1. live report   ocx provider quota --json
-#   2. cached report /root/.opencodex/codex-quota-cache.json     (written by the proxy)
-#   3. own state     /var/lib/codex-window-keeper/last_success_epoch + 5 hours
+#   1. live report   GET https://chatgpt.com/backend-api/wham/usage
+#                    (ChatGPT login token from $CODEX_HOME/auth.json)
+#   2. own state     /var/lib/codex-window-keeper/last_success_epoch + 5 hours
 #
-# Two decision modes are supported because the quota report has two shapes:
-#   * window in use (fiveHourPercent > 0): the report carries a real upstream
+# Two decision modes, because the usage report has two shapes:
+#   * window in use (primary_window.used_percent > 0): the report carries a real
 #     reset timestamp.  Wait for it, then send exactly one request.
-#   * window idle (fiveHourPercent == 0): the upstream has fully recovered the
-#     budget and the proxy recomputes fiveHourResetAt as "now + 5h" on every
-#     refresh, so that timestamp never arrives.  In this state we keep our own
+#   * window idle (used_percent == 0): OpenAI reports reset_at as "now + 5h" on
+#     every call, so that timestamp never arrives.  In this state we keep our own
 #     five-hour cadence from the last successful trigger.
+#
+# The usage endpoint is undocumented.  If it is unreachable or rejects the token,
+# the own-state fallback is used; the ping itself makes the Codex CLI refresh
+# its token.
 #
 # A live request is sent only when the trigger is due AND LIVE_TRIGGER_ENABLED=1
 # in /etc/default/codex-window-keeper.  Use --dry-run to see the decision and
-# the exact command without contacting Codex at all.
+# the exact command without sending a request.
 #
-# Verified against the installed CLI: exec --ephemeral --json --model --config
+# Verified against codex-cli 0.160.0: exec --ephemeral --json --model --config
 # --sandbox --cd --skip-git-repo-check.
 #
 set -Eeuo pipefail
@@ -40,17 +43,21 @@ STATE_DIR="${STATE_DIR:-/var/lib/codex-window-keeper}"
 LOCK_FILE="$STATE_DIR/keeper.lock"
 LAST_SUCCESS_FILE="$STATE_DIR/last_success_epoch"
 HISTORY_FILE="$STATE_DIR/trigger-history.log"
-QUOTA_CACHE_FILE="${QUOTA_CACHE_FILE:-/root/.opencodex/codex-quota-cache.json}"
+
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+AUTH_FILE="${AUTH_FILE:-$CODEX_HOME/auth.json}"
+USAGE_URL="${USAGE_URL:-https://chatgpt.com/backend-api/wham/usage}"
+# Pins the ping to ChatGPT directly, ignoring any openai_base_url in config.toml
+# (for example one pointing at a local proxy).
+CODEX_BASE_URL="${CODEX_BASE_URL:-https://chatgpt.com/backend-api/codex}"
 
 WINDOW_SECONDS="${WINDOW_SECONDS:-18000}"
-QUOTA_MAX_AGE_SECONDS="${QUOTA_MAX_AGE_SECONDS:-21600}"
 LIVE_TRIGGER_ENABLED="${LIVE_TRIGGER_ENABLED:-0}"
-KEEPER_MODEL="${KEEPER_MODEL:-gpt-5.6-luna}"
+KEEPER_MODEL="${KEEPER_MODEL:-gpt-6-luna}"
 KEEPER_REASONING_EFFORT="${KEEPER_REASONING_EFFORT:-low}"
 KEEPER_PROMPT="${KEEPER_PROMPT:-Reply with exactly: Hi}"
 KEEPER_WORKDIR="${KEEPER_WORKDIR:-/tmp}"
 EXEC_TIMEOUT_SECONDS="${EXEC_TIMEOUT_SECONDS:-180}"
-OCX_BIN="${OCX_BIN:-/usr/local/bin/ocx}"
 CODEX_BIN="${CODEX_BIN:-}"
 
 DRY_RUN=0
@@ -93,10 +100,6 @@ if ! is_uint "$WINDOW_SECONDS" || (( WINDOW_SECONDS <= 0 )); then
   log "ERROR: WINDOW_SECONDS must be a positive integer"
   exit 1
 fi
-if ! is_uint "$QUOTA_MAX_AGE_SECONDS" || (( QUOTA_MAX_AGE_SECONDS <= 0 )); then
-  log "ERROR: QUOTA_MAX_AGE_SECONDS must be a positive integer"
-  exit 1
-fi
 if [[ "$LIVE_TRIGGER_ENABLED" != 0 && "$LIVE_TRIGGER_ENABLED" != 1 ]]; then
   log "ERROR: LIVE_TRIGGER_ENABLED must be 0 or 1"
   exit 1
@@ -121,109 +124,63 @@ if [[ -r "$LAST_SUCCESS_FILE" ]]; then
 fi
 
 now_epoch="$(date +%s)"
-now_ms="$((now_epoch * 1000))"
 
 # Resolve the installed CLI up front so --dry-run can print the exact command.
 if [[ -z "$CODEX_BIN" ]]; then
-  if [[ -x /root/.codex/packages/standalone/current/bin/codex ]]; then
-    CODEX_BIN="/root/.codex/packages/standalone/current/bin/codex"
+  if [[ -x "$CODEX_HOME/packages/standalone/current/bin/codex" ]]; then
+    CODEX_BIN="$CODEX_HOME/packages/standalone/current/bin/codex"
   else
     CODEX_BIN="$(command -v codex || true)"
   fi
 fi
 
-# Extract "updatedMillis<TAB>resetEpoch<TAB>usedPercent" from a quota document.
-# Deliberately tolerant: a missing updatedAt is treated as unknown rather than
-# as a reason to discard the document, and a missing percentage becomes -1.
-extract_openai_quota() {
-  jq -er '
-    [
-      .reports[]
-      | select(.provider == "openai")
-      | ((.aggregation.currentAccount.quota // {}) + (.quota // {})) as $q
-      | select(($q.fiveHourResetAt // $q.shortResetAt) != null)
-      | [
-          (($q.updatedAt // .updatedAt // 0) | tonumber),
-          (($q.fiveHourResetAt // $q.shortResetAt) | tonumber),
-          (($q.fiveHourPercent // $q.shortPercent // -1) | tonumber)
-        ]
-    ]
-    | first // empty
-    | @tsv
-  ' 2>/dev/null
-}
-
-# Extract the same three fields from the proxy cache, which has its own shape.
-extract_cached_quota() {
-  jq -er '
-    (.mainPolicyQuota.quota // .quotas.__main__ // {}) as $q
-    | select(($q.shortResetAt // $q.fiveHourResetAt) != null)
-    | [
-        (($q.updatedAt // 0) | tonumber),
-        (($q.shortResetAt // $q.fiveHourResetAt) | tonumber),
-        (($q.shortPercent // $q.fiveHourPercent // -1) | tonumber)
-      ]
-    | @tsv
-  ' 2>/dev/null
-}
-
-# Store a candidate reading.  Returns 0 when it is usable, 1 when unusable or
-# too stale to trust.
-accept_reading() {
-  local updated_ms="$1" reset_epoch="$2" used_percent="$3" source_name="$4"
-  is_uint "$updated_ms" || return 1
-  is_uint "$reset_epoch" || return 1
-  (( reset_epoch > 0 )) || return 1
-  is_uint "$used_percent" || return 1
-  (( used_percent <= 100 )) || return 1
-  if (( updated_ms > 0 )) && (( now_ms - updated_ms > QUOTA_MAX_AGE_SECONDS * 1000 )); then
+# Read the five-hour window from the usage endpoint.  Sets usage_status ("ok" or
+# a reason), quota_reset_epoch and quota_used_percent.  The token is passed to
+# curl on stdin so it never appears in argv.
+fetch_quota() {
+  usage_status="ok"
+  quota_reset_epoch=0
+  quota_used_percent=-1
+  local token account body code window
+  token="$(jq -er '.tokens.access_token' "$AUTH_FILE" 2>/dev/null)" || {
+    usage_status="no access token in $AUTH_FILE"
+    return 1
+  }
+  account="$(jq -er '.tokens.account_id' "$AUTH_FILE" 2>/dev/null)" || {
+    usage_status="no account_id in $AUTH_FILE"
+    return 1
+  }
+  body="$(printf 'header = "Authorization: Bearer %s"\nheader = "chatgpt-account-id: %s"\n' "$token" "$account" |
+    curl -sS -m 20 -K - -w '\n%{http_code}' "$USAGE_URL" 2>&1)" || {
+    usage_status="usage request failed"
+    return 1
+  }
+  code="${body##*$'\n'}"
+  body="${body%$'\n'*}"
+  if [[ "$code" != 200 ]]; then
+    usage_status="usage endpoint returned HTTP $code"
     return 1
   fi
-  quota_source="$source_name"
-  quota_updated_ms="$updated_ms"
-  quota_reset_epoch="$reset_epoch"
-  quota_used_percent="$used_percent"
+  window="$(jq -er '.rate_limit.primary_window | [.reset_at, .used_percent] | @tsv' <<<"$body" 2>/dev/null)" || {
+    usage_status="usage response has no primary_window"
+    return 1
+  }
+  IFS=$'\t' read -r quota_reset_epoch quota_used_percent <<<"$window"
+  # used_percent can be fractional; the idle test only needs the integer part.
+  quota_used_percent="${quota_used_percent%%.*}"
+  if ! is_uint "$quota_reset_epoch" || ! is_uint "$quota_used_percent" || (( quota_used_percent > 100 )); then
+    usage_status="unusable window (reset=$quota_reset_epoch percent=$quota_used_percent)"
+    return 1
+  fi
   return 0
 }
 
 quota_source="none"
-quota_updated_ms=0
-quota_reset_epoch=0
-quota_used_percent=-1
-
-# Source 1: live report from the OpenCodex proxy.
-if [[ -x "$OCX_BIN" ]] && command -v jq >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
-  if quota_json="$(timeout 30 "$OCX_BIN" provider quota --json 2>/dev/null)" && [[ -n "$quota_json" ]]; then
-    if quota_tsv="$(extract_openai_quota <<<"$quota_json")" && [[ -n "$quota_tsv" ]]; then
-      IFS=$'\t' read -r reading_updated_ms reading_reset_epoch reading_used_percent <<< "$quota_tsv"
-      if ! accept_reading "$reading_updated_ms" "$reading_reset_epoch" "$reading_used_percent" "ocx-live-report"; then
-        log "live quota report unusable (updated=$reading_updated_ms reset=$reading_reset_epoch percent=$reading_used_percent); trying the proxy cache"
-      fi
-    else
-      log "live quota report has no five-hour reset field; trying the proxy cache"
-    fi
-  else
-    log "live quota report unavailable; trying the proxy cache"
-  fi
-fi
-
-# Source 2: the cache the proxy writes on every observation.
-if [[ "$quota_source" == "none" && -r "$QUOTA_CACHE_FILE" ]] && command -v jq >/dev/null 2>&1; then
-  if cache_tsv="$(extract_cached_quota < "$QUOTA_CACHE_FILE")" && [[ -n "$cache_tsv" ]]; then
-    IFS=$'\t' read -r reading_updated_ms reading_reset_epoch reading_used_percent <<< "$cache_tsv"
-    if ! accept_reading "$reading_updated_ms" "$reading_reset_epoch" "$reading_used_percent" "ocx-quota-cache"; then
-      log "proxy cache is stale or unusable (updated=$reading_updated_ms reset=$reading_reset_epoch percent=$reading_used_percent)"
-    fi
-  else
-    log "proxy cache has no usable five-hour reset field"
-  fi
-fi
-
 due=0
 due_reason=""
 
-if [[ "$quota_source" != "none" ]]; then
-  quota_updated_text="$(format_epoch "$((quota_updated_ms / 1000))")"
+if fetch_quota; then
+  quota_source="wham-usage"
   quota_reset_text="$(format_epoch "$quota_reset_epoch")"
 
   if (( quota_used_percent == 0 )); then
@@ -240,7 +197,7 @@ if [[ "$quota_source" != "none" ]]; then
       exit 0
     fi
   elif (( now_epoch < quota_reset_epoch )); then
-    log "window active: ${quota_used_percent}% used; next reset $quota_reset_text (source=$quota_source, observed $quota_updated_text)"
+    log "window active: ${quota_used_percent}% used; next reset $quota_reset_text (source=$quota_source)"
     exit 0
   elif (( last_success_epoch >= quota_reset_epoch )); then
     log "reset at $quota_reset_text already has a successful keeper trigger at $(format_epoch "$last_success_epoch"); nothing to do"
@@ -250,6 +207,7 @@ if [[ "$quota_source" != "none" ]]; then
     due_reason="reset at $quota_reset_text has passed with no keeper trigger for it"
   fi
 else
+  log "WARN: $usage_status; falling back to own cadence"
   # No trustworthy reading at all: only our own state file is available.
   if (( last_success_epoch == 0 )); then
     log "no quota reading and no keeper baseline; refusing to guess when the window expired"
@@ -268,13 +226,26 @@ if (( due == 1 )); then
   log "trigger due: $due_reason"
 fi
 
+codex_args=(
+  exec
+  --ephemeral
+  --json
+  --model "$KEEPER_MODEL"
+  --config "model_reasoning_effort=\"$KEEPER_REASONING_EFFORT\""
+  --config "openai_base_url=\"$CODEX_BASE_URL\""
+  --sandbox read-only
+  --cd "$KEEPER_WORKDIR"
+  --skip-git-repo-check
+  "$KEEPER_PROMPT"
+)
+
 if [[ "$DRY_RUN" == 1 || "$LIVE_TRIGGER_ENABLED" == 0 ]]; then
   if [[ "$DRY_RUN" == 1 ]]; then
     log "dry-run: no Codex request will be sent"
   else
     log "live trigger is disarmed by $DEFAULTS_FILE; no Codex request will be sent"
   fi
-  log "would run: $CODEX_BIN exec --ephemeral --json --model $KEEPER_MODEL --config 'model_reasoning_effort=\"$KEEPER_REASONING_EFFORT\"' --sandbox read-only --cd $KEEPER_WORKDIR --skip-git-repo-check \"$KEEPER_PROMPT\""
+  log "would run: $CODEX_BIN ${codex_args[*]}"
   exit 0
 fi
 
@@ -287,17 +258,6 @@ if ! command -v timeout >/dev/null 2>&1; then
   exit 1
 fi
 
-codex_args=(
-  exec
-  --ephemeral
-  --json
-  --model "$KEEPER_MODEL"
-  --config "model_reasoning_effort=\"$KEEPER_REASONING_EFFORT\""
-  --sandbox read-only
-  --cd "$KEEPER_WORKDIR"
-  --skip-git-repo-check
-  "$KEEPER_PROMPT"
-)
 log "sending one live keeper request with model=$KEEPER_MODEL effort=$KEEPER_REASONING_EFFORT"
 log "live command: $CODEX_BIN ${codex_args[*]}"
 

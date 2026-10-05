@@ -1,0 +1,11 @@
+# Set to 0 to disarm (the script then only logs what it would do).
+LIVE_TRIGGER_ENABLED=1
+
+# Codex five-hour window.
+WINDOW_SECONDS=18000
+
+KEEPER_MODEL=gpt-6-luna
+KEEPER_REASONING_EFFORT=low
+KEEPER_PROMPT='Reply with exactly: Hi'
+KEEPER_WORKDIR=/tmp
+EXEC_TIMEOUT_SECONDS=180
